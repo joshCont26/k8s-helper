@@ -8,20 +8,23 @@ anything by hand.
 ## Index
 
 1. [Requirements](#requirements)
-2. [How to use the tool](#how-to-use-the-tool)
+2. [Installation](#installation)
+   - [Clone the repository](#clone-the-repository)
+   - [Updating to the latest version](#updating-to-the-latest-version)
+3. [How to use the tool](#how-to-use-the-tool)
    - [Running it directly](#running-it-directly)
    - [Commands and options](#commands-and-options)
    - [Where the report is looked for](#where-the-report-is-looked-for)
    - [Cache and re-indexing](#cache-and-re-indexing)
-3. [Shortcut: run `k8s` from anywhere](#shortcut-run-k8s-from-anywhere)
-4. [Menu reference](#menu-reference)
+4. [Shortcut: run `k8s` from anywhere](#shortcut-run-k8s-from-anywhere)
+5. [Menu reference](#menu-reference)
    - [Navigation keys](#navigation-keys)
    - [1 health summary](#1-health-summary)
    - [2 pods](#2-pods)
    - [3 warning events](#3-warning-events)
    - [4 resources (used vs requested vs limit)](#4-resources-used-vs-requested-vs-limit)
    - [5 bundle files](#5-bundle-files)
-5. [Directory structure](#directory-structure)
+6. [Directory structure](#directory-structure)
    - [Tool folder](#tool-folder)
    - [Shortcut link](#shortcut-link)
    - [Cache folder](#cache-folder)
@@ -33,14 +36,65 @@ anything by hand.
 
 - macOS with the stock `/bin/bash` (3.2) and BSD tools. Nothing to install:
   no `jq`, `yq`, Python or Homebrew packages.
+- `git`, to clone the repository. Check with `git --version`. If git is
+  missing, macOS offers to install the Command Line Developer Tools; accept.
 - A Securiti report bundle (`.tar.gz`, `.tgz`, `.tar`, or an already
   extracted folder) that contains a `k8s-podlist` file.
+
+## Installation
+
+The tool lives at <https://github.com/joshCont26/k8s-helper>. Clone it
+rather than downloading single files: the scripts depend on each other and
+on the `lib/` folder.
+
+### Clone the repository
+
+1. Pick a folder for your tools and go there. Any folder works; `~/code` is
+   used here as an example. A plain local folder is safer than one synced by
+   OneDrive or iCloud, which can interfere with git's internal files.
+
+   ```bash
+   mkdir -p ~/code
+   cd ~/code
+   ```
+
+2. Clone the repository. This creates a `k8s-helper` folder:
+
+   ```bash
+   git clone https://github.com/joshCont26/k8s-helper.git
+   cd k8s-helper
+   ```
+
+3. Check that it runs:
+
+   ```bash
+   ./k8s-help --help
+   ```
+
+   You should see the usage text. The scripts are stored in the repository
+   as executable, so no `chmod` is needed. If you get `permission denied`
+   anyway, run `chmod +x k8s k8s-help`.
+
+4. Optional but recommended: set up the [`k8s` shortcut](#shortcut-run-k8s-from-anywhere)
+   so you can run the tool from any folder.
+
+### Updating to the latest version
+
+From your `k8s-helper` folder:
+
+```bash
+git pull
+```
+
+The `k8s` shortcut points at this folder, so it picks up the update with no
+reinstall. If an update changes the index format, each bundle's cache is
+rebuilt automatically the next time you open it.
 
 ## How to use the tool
 
 ### Running it directly
 
-From the `k8s-helper` folder:
+From your cloned `k8s-helper` folder:
 
 ```bash
 ./k8s-help --file=report-1787683060.tar.gz
@@ -116,10 +170,11 @@ anything asks again. Tab completes paths.
 
 ### Setting it up
 
-1. Make sure the scripts are executable (run in the `k8s-helper` folder):
+1. [Clone the repository](#clone-the-repository) if you haven't already,
+   and go into the cloned folder:
 
    ```bash
-   chmod +x k8s k8s-help
+   cd ~/code/k8s-helper
    ```
 
 2. Make sure `~/bin` exists and is on your PATH. Check with:
@@ -143,7 +198,7 @@ anything asks again. Tab completes paths.
    ```
 
    Use a link, not a copy: the launcher finds `k8s-help` and `lib/` through
-   the link, and later updates to the folder take effect without
+   the link, and a `git pull` in the folder takes effect without
    reinstalling.
 
 4. Check it, from any folder:
@@ -152,8 +207,8 @@ anything asks again. Tab completes paths.
    type k8s        # should print: k8s is /Users/<you>/bin/k8s
    ```
 
-If you move the `k8s-helper` folder, re-create the link:
-`ln -sf "$PWD/k8s" ~/bin/k8s`.
+If you move the `k8s-helper` folder or clone it somewhere else, re-create the
+link from the new location: `ln -sf "$PWD/k8s" ~/bin/k8s`.
 
 ### Using it
 
@@ -340,17 +395,20 @@ in `less`. Use this for raw data the other views don't cover, such as
 
 ## Directory structure
 
-The tool touches three places: the tool folder (which you copy or clone),
-one link in `~/bin` for the shortcut, and a cache folder that the tool
-creates and manages itself.
+The tool touches three places: the tool folder (cloned from GitHub), one
+link in `~/bin` for the shortcut, and a cache folder that the tool creates
+and manages itself.
 
 ### Tool folder
 
-Keep these files together. `k8s-help` loads `lib/` from the folder it lives
-in, so the folder can be anywhere, but its contents must keep this layout.
+This is what `git clone` creates. Keep these files together: `k8s-help`
+loads `lib/` from the folder it lives in, so the folder can be anywhere, but
+its contents must keep this layout.
 
 ```
 k8s-helper/
+├── .git/              git's own data (created by the clone; don't edit)
+├── .gitignore         keeps report bundles and .DS_Store out of the repo
 ├── README.md          this file
 ├── k8s                launcher: asks for the report file, runs k8s-help   (executable)
 ├── k8s-help           main entry point: options, caching, health summary  (executable)
@@ -361,9 +419,12 @@ k8s-helper/
     └── menu.sh        interactive menu and lists
 ```
 
-`k8s` and `k8s-help` must be executable (`chmod +x k8s k8s-help`). The files
-in `lib/` are loaded by `k8s-help`, not run on their own, so they don't need
-to be.
+`k8s` and `k8s-help` are executable straight from the clone. The files in
+`lib/` are loaded by `k8s-help`, not run on their own, so they aren't.
+
+Never copy report bundles into this folder to share them: they contain
+customer cluster data. `.gitignore` blocks `.tar.gz`, `.tgz` and `.tar`
+files, but keep bundles outside the repository anyway.
 
 ### Shortcut link
 

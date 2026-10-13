@@ -1,0 +1,46 @@
+#!/bin/bash
+# k8s -- launcher for k8s-help. Asks for the report bundle, then runs
+#
+#   k8s-help --file=<answer> [command]
+#
+# usage:  k8s                      prompt for the file, open the menu
+#         k8s summary              prompt for the file, print the summary
+#         k8s report.tar.gz [cmd]  skip the prompt
+#
+# Meant to be symlinked onto PATH (e.g. ~/bin/k8s), so it resolves its own
+# real location to find k8s-help next to it.
+#
+# Targets macOS /bin/bash 3.2 + BSD userland. See lib/common.sh.
+
+set -u
+
+# Follow the symlink chain by hand: BSD readlink has no -f before macOS 12.3.
+_self=$0
+while [ -L "$_self" ]; do
+  _link=$(readlink "$_self")
+  case "$_link" in
+    /*) _self=$_link ;;
+    *)  _self="$(dirname "$_self")/$_link" ;;
+  esac
+done
+SELF_DIR=$(cd "$(dirname "$_self")" && pwd)
+HELPER="$SELF_DIR/k8s-help"
+[ -x "$HELPER" ] || { printf 'k8s: cannot find k8s-help at %s\n' "$HELPER" >&2; exit 1; }
+
+FILE=""
+case "${1:-}" in
+  ""|summary|reindex|menu|-*) ;;
+  *) FILE=$1; shift ;;
+esac
+
+if [ -z "$FILE" ]; then
+  [ -t 0 ] || { printf 'k8s: no file given and stdin is not a terminal\n' >&2; exit 2; }
+  # The bracketed text is a format hint only; an empty answer asks again.
+  while [ -z "$FILE" ]; do
+    printf 'report file [report-##########.tar.gz]: '
+    # -e gives readline editing and tab-completion of paths.
+    read -r -e FILE || { printf '\n'; exit 130; }
+  done
+fi
+
+exec "$HELPER" --file="$FILE" "$@"

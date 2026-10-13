@@ -1,0 +1,756 @@
+#!/bin/bash
+# k8s-help -- interactive triage for Securiti appliance Kubernetes report
+# bundles.
+#
+# usage:  ./k8s-help --file=<report.tar.gz> [command]
+#
+# The value of --file may be a bare filename, a relative path or an absolute
+# path. When it is not directly openable, the filesystem is searched for it
+# (see lib/locate.sh for the tiered strategy).
+#
+# commands:
+#   menu        interactive browser      (default on a terminal)
+#   summary     cluster health summary  (default when piped)
+#   reindex     force a rebuild of the indexes, then open
+#
+# options:
+#   --file=NAME  report bundle to open            (required)
+#   --no-color   disable ANSI colour
+#   -h, --help   this message
+#
+# Targets macOS /bin/bash 3.2 + BSD userland. See lib/common.sh.
+
+set -u
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+. "$SELF_DIR/lib/common.sh"
+. "$SELF_DIR/lib/locate.sh"
+. "$SELF_DIR/lib/ingest.sh"
+. "$SELF_DIR/lib/menu.sh"
+
+# ------------------------------------------------------------------- bootstrap
+
+usage() {
+  cat >&2 <<EOF
+usage: $(basename "$0") --file=<report.tar.gz> [summary|reindex|menu]
+
+  --file=NAME   report bundle to open. May be a bare filename, in which case
+                the filesystem is searched for it.
+  --no-color    disable ANSI colour
+  -h, --help    show this message
+
+examples:
+  $(basename "$0") --file=report-1787683060_tar.gz
+  $(basename "$0") --file=~/Downloads/report.tar.gz summary
+  $(basename "$0") --file=report.tar.gz reindex
+EOF
+  exit 2
+}
+
+FILE_ARG=""
+CMD=""
+
+# bash 3.2 has no --long option support of any kind, so parse by hand.
+# Both --file=X and --file X are accepted because people will type both.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --file=*)   FILE_ARG=${1#--file=} ;;
+    --file)     shift; [ $# -gt 0 ] || die "--file requires a value"; FILE_ARG=$1 ;;
+    -f)         shift; [ $# -gt 0 ] || die "-f requires a value";     FILE_ARG=$1 ;;
+    --no-color) K8SDIAG_NO_COLOR=1; export K8SDIAG_NO_COLOR
+                . "$SELF_DIR/lib/common.sh" ;;
+    -h|--help)  usage ;;
+    summary|reindex|menu) CMD=$1 ;;
+    -*)         die "unknown option: $1" ;;
+    *)          die "unexpected argument: $1 (did you mean --file=$1 ?)" ;;
+  esac
+  shift
+done
+
+[ -n "$FILE_ARG" ] || usage
+
+# Expand a leading ~ ourselves: it only expands when the shell sees it
+# unquoted, and --file=~/x arrives here as a literal tilde.
+case "$FILE_ARG" in
+  "~/"*) FILE_ARG="$HOME/${FILE_ARG#~/}" ;;
+  "~")   FILE_ARG="$HOME" ;;
+esac
+
+if [ -d "$FILE_ARG" ]; then
+  BUNDLE_ARG=$FILE_ARG
+else
+  BUNDLE_ARG=$(locate_report "$FILE_ARG") || {
+    printf '%s\n' "file not found, please try again" >&2
+    exit 1
+  }
+  [ -n "$BUNDLE_ARG" ] || {
+    printf '%s\n' "file not found, please try again" >&2
+    exit 1
+  }
+  [ -r "$BUNDLE_ARG" ] || die "found $BUNDLE_ARG but it is not readable"
+  info "using $BUNDLE_ARG"
+fi
+
+# Stable per-bundle work dir so repeat runs skip extraction and reindexing.
+#
+# The key is basename+size, not basename alone. Support reports are very
+# often all called the same thing, and keying on the name by itself would
+# serve case B the cached index built from case A without any hint that it
+# had done so.
+#
+# printf (not echo) so tr never sees a trailing newline and turns it into a
+# stray "_" on the end of every work dir name.
+_key=$(printf '%s' "$(basename "$BUNDLE_ARG")" | tr -c 'A-Za-z0-9._-' '_')
+if [ -f "$BUNDLE_ARG" ]; then
+  _key="${_key}-$(fsize "$BUNDLE_ARG")"
+fi
+WORK="${K8SDIAG_HOME:-$HOME/.k8sdiag}/$_key"
+IDX="$WORK/index"
+
+if [ "$CMD" = "reindex" ]; then
+  rm -rf "$IDX" "$WORK/.extracted"
+  CMD=""
+fi
+
+if [ ! -f "$IDX/facts.tsv" ]; then
+  ingest_all "$BUNDLE_ARG" "$WORK"
+elif [ "$(fact "$IDX/facts.tsv" index_version)" != "$INDEX_VERSION" ]; then
+  # Built by an older k8s-help: missing indexes the current code reads.
+  info "index format changed; rebuilding..."
+  rm -rf "$IDX"
+  ingest_all "$BUNDLE_ARG" "$WORK"
+else
+  SRC=$(fact "$IDX/facts.tsv" source_dir)
+  [ -d "$SRC" ] || { rm -rf "$IDX"; ingest_all "$BUNDLE_ARG" "$WORK"; }
+fi
+
+# --------------------------------------------------------------------- summary
+
+hdr() { printf '\n%s%s%s\n' "$C_B$C_CYN" "$1" "$C_RST"; }
+
+sum_cluster() {
+  hdr "CLUSTER"
+  {
+    printf 'node\t%s\n'     "$(fact "$IDX/facts.tsv" node_name)"
+    printf 'roles\t%s\n'    "$(fact "$IDX/facts.tsv" node_roles)"
+    printf 'kubelet\t%s\n'  "$(fact "$IDX/facts.tsv" kubelet)"
+    printf 'runtime\t%s\n'  "$(fact "$IDX/facts.tsv" runtime)"
+    printf 'os\t%s\n'       "$(fact "$IDX/facts.tsv" os)"
+    printf 'capacity\t%s cpu / %s\n' \
+      "$(fact "$IDX/facts.tsv" node_cpu)" "$(fact "$IDX/facts.tsv" node_memory)"
+    printf 'window\t%s .. %s\n' \
+      "$(fact "$IDX/facts.tsv" events_from)" "$(fact "$IDX/facts.tsv" events_to)"
+  } | tsv_table | sed 's/^/  /'
+
+  _ready=$(fact "$IDX/facts.tsv" node_ready)
+  if [ -n "$_ready" ] && [ "$_ready" != "True" ]; then
+    printf '  %sNODE NOT READY: %s%s\n' "$C_RED" "$_ready" "$C_RST"
+  fi
+  awk -F'\t' -v r="$C_RED" -v x="$C_RST" \
+    '$1 ~ /^pressure_/ { printf "  %sPRESSURE %s = %s%s\n", r, $1, $2, x }' \
+    "$IDX/facts.tsv"
+}
+
+sum_pods() {
+  hdr "PODS"
+  awk -F'\t' '
+    BEGIN { OFS = "\t" }
+    { st[$4]++; tot++ ; if ($5 > 0) rst++ }
+    END {
+      print "total", tot
+      for (s in st) print s, st[s]
+      print "with restarts", rst + 0
+    }
+  ' "$IDX/pods.tsv" | sort | tsv_table | sed 's/^/  /'
+
+  # Anything not Running/Succeeded is worth naming explicitly.
+  _bad=$(awk -F'\t' '$4 != "Running" && $4 != "Succeeded" { print }' "$IDX/pods.tsv")
+  if [ -n "$_bad" ]; then
+    printf '\n  %sNOT HEALTHY%s\n' "$C_RED" "$C_RST"
+    printf '%s\n' "$_bad" | awk -F'\t' 'BEGIN{OFS="\t"}{print $1,$2,$3,$4,$5}' \
+      | tsv_table | sed 's/^/    /'
+  fi
+
+  # Ready mismatch on something that should be serving traffic.
+  _nr=$(awk -F'\t' '
+    $4 == "Running" { split($3, a, "/"); if (a[1] != a[2]) print }
+  ' "$IDX/pods.tsv")
+  if [ -n "$_nr" ]; then
+    printf '\n  %sRUNNING BUT NOT READY%s\n' "$C_YEL" "$C_RST"
+    printf '%s\n' "$_nr" | awk -F'\t' 'BEGIN{OFS="\t"}{print $1,$2,$3,$5}' \
+      | tsv_table | sed 's/^/    /'
+  fi
+}
+
+# Rank restarting pods by rate rather than by lifetime total. A pod with 22
+# restarts across 60 days is a slow background annoyance; one with 9 across
+# 6 days is actively broken. Raw count sorting inverts that.
+_restart_rows() {
+  # _restart_rows <baseline>
+  awk -F'\t' -v b="$1" '
+    BEGIN { OFS = "\t" }
+
+    # kubectl AGE is a concatenation of up to two magnitude-unit pairs,
+    # e.g. "60d5h", "23h4m", "7m41s", "83d22h". There is no portable date(1)
+    # arithmetic on macOS, so decode it directly.
+    function age_hours(a,   h, n, u, i, c) {
+      h = 0; n = ""
+      for (i = 1; i <= length(a); i++) {
+        c = substr(a, i, 1)
+        if (c >= "0" && c <= "9") { n = n c; continue }
+        u = c
+        if      (u == "d") h += n * 24
+        else if (u == "h") h += n
+        else if (u == "m") h += n / 60
+        else if (u == "s") h += n / 3600
+        n = ""
+      }
+      return h
+    }
+
+    $5 + 0 > b + 0 {
+      hrs = age_hours($6)
+      days = (hrs > 0 ? hrs / 24 : 0)
+      rate = (days > 0 ? $5 / days : $5)
+      printf "%.4f\t%s\t%s\t%s\t%s\t%.2f\n", rate, $1, $2, $5, $6, rate
+    }
+  ' "$IDX/pods.tsv" \
+  | sort -t"$TAB" -k1,1nr \
+  | awk -F'\t' 'BEGIN{ OFS="\t"; print "NAMESPACE","POD","RESTARTS","AGE","PER-DAY" }
+                { print $2, $3, $4, $5, $6 }' \
+  | tsv_table
+}
+
+# Modal non-zero restart count: after a node reboot every pod restarts the
+# same number of times, so the most common count is the reboot's signature.
+_restart_baseline() {
+  awk -F'\t' '$5 > 0 { c[$5]++ } END {
+    m = 0; b = 0
+    for (k in c) if (c[k] > m || (c[k] == m && k + 0 < b + 0)) { m = c[k]; b = k }
+    print b + 0
+  }' "$IDX/pods.tsv"
+}
+
+sum_restarts() {
+  # The point of this section: separate restarts explained by a node reboot
+  # from restarts a workload incurred on its own. Sorting on raw restart
+  # count alone would put 19 innocent pods at the top of the list.
+  _reboot=$(fact "$IDX/facts.tsv" node_reboot)
+
+  hdr "RESTARTS"
+  if [ -n "$_reboot" ]; then
+    _base=$(_restart_baseline)
+    printf '  node rebooted at %s%s%s\n' "$C_YEL" "$_reboot" "$C_RST"
+    printf '  modal restart count is %s -- treating that as the reboot baseline\n' "$_base"
+    printf '  %sabove baseline, ranked by restarts/day (not raw count):%s\n' \
+      "$C_RED" "$C_RST"
+    _restart_rows "$_base" | sed 's/^/    /'
+    printf '  %spods at baseline (explained by the reboot):%s %s\n' \
+      "$C_DIM" "$C_RST" \
+      "$(awk -F'\t' -v b="$_base" '$5 + 0 == b + 0' "$IDX/pods.tsv" | wc -l | tr -d ' ')"
+  else
+    _restart_rows 0 | sed 's/^/  /'
+  fi
+}
+
+sum_events() {
+  hdr "EVENTS (warnings)"
+  _w=$(awk -F'\t' '$2 == "Warning"' "$IDX/events.tsv")
+  if [ -z "$_w" ]; then
+    printf '  none\n'
+    return
+  fi
+  printf '%s\n' "$_w" | awk -F'\t' '
+    BEGIN { OFS = "\t" }
+    { n[$3] += ($7 + 0); ex[$3] = $8 }
+    END { for (r in n) print n[r], r, substr(ex[r], 1, 72) }
+  ' | sort -t"$TAB" -k1,1nr | tsv_table | sed 's/^/  /'
+}
+
+sum_usage() {
+  hdr "TOP MEMORY CONSUMERS"
+  awk -F'\t' '
+    BEGIN { OFS = "\t" }
+    {
+      m = $5; sub(/Mi$/, "", m)
+      print m + 0, $2 "/" $3, $4, $5
+    }
+  ' "$IDX/usage.tsv" | sort -t"$TAB" -k1,1nr | head -8 \
+    | awk -F'\t' 'BEGIN{OFS="\t"}{print $2, $3, $4}' | tsv_table | sed 's/^/  /'
+
+  if [ -f "$SRC/k8s-top-nodes" ]; then
+    printf '\n'
+    sed -n '2p' "$SRC/k8s-top-nodes" | awk '{printf "  node: %s cpu %s, mem %s (%s)\n", $2, $3, $4, $5}'
+  fi
+}
+
+sum_logs() {
+  hdr "LOGS BY SEVERITY"
+  _rows=$(awk -F'\t' '
+    BEGIN { OFS = "\t" }
+    $7 + 0 > 0 || $8 + 0 > 0 { print $7 + 0, $8 + 0, $2 "/" $3, $4 }
+  ' "$IDX/logs.tsv" | sort -t"$TAB" -k1,1nr -k2,2nr | head -12)
+
+  if [ -n "$_rows" ]; then
+    { printf 'ERR\tWARN\tCONTAINER\tLOG\n'; printf '%s\n' "$_rows"; } \
+      | tsv_table | sed 's/^/  /'
+  else
+    printf '  no error or warning lines found\n'
+  fi
+
+  awk -F'\t' -v d="$C_DIM" -v x="$C_RST" '
+    { tot++ ; if ($5 + 0 == 0) empty++ }
+    END { printf "  %s%d log files indexed, %d empty%s\n", d, tot, empty + 0, x }
+  ' "$IDX/logs.tsv"
+}
+
+sum_coverage() {
+  hdr "BUNDLE COVERAGE"
+  _p=$(flines "$IDX/pods.tsv")
+  _c=$(awk -F'\t' '{print $1"/"$2}' "$IDX/containers.tsv" | sort -u | wc -l | tr -d ' ')
+  printf '  pods in podlist:        %s\n' "$_p"
+  printf '  pods with describe:     %s\n' "$_c"
+  _miss=$(awk -F'\t' 'NR==FNR{d[$1"/"$2]=1;next} !(($1"/"$2) in d){print "    " $1 "/" $2}' \
+    "$IDX/containers.tsv" "$IDX/pods.tsv")
+  if [ -n "$_miss" ]; then
+    printf '  %sno describe data for:%s\n' "$C_YEL" "$C_RST"
+    printf '%s\n' "$_miss"
+  fi
+}
+
+# --------------------------------------------------------------- health table
+#
+# One row per component: CHECK STATUS RESULT DETAIL. STATUS is OK / WARN /
+# FAIL, or N/A when the bundle carries no data for that check, or INFO when
+# the row describes the bundle rather than the cluster. Offending objects for
+# every non-OK row are listed beneath the table so each row stays one line.
+
+_HT=""
+
+_hrow() {
+  # _hrow <check> <status> <result> [detail]
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}" >> "$_HT/rows"
+}
+
+_hdet() {
+  # _hdet <title>   -- TSV on stdin, first line is the column header
+  _hd_in=$(cat)
+  _hd_n=$(printf '%s\n' "$_hd_in" | wc -l | tr -d ' ')
+  [ "$_hd_n" -gt 1 ] || return 0
+  {
+    printf '\n  %s%s%s\n' "$C_B" "$1" "$C_RST"
+    printf '%s\n' "$_hd_in" | head -16 | tsv_box | sed 's/^/    /'
+    if [ "$_hd_n" -gt 16 ]; then
+      printf '    %s... and %s more%s\n' "$C_DIM" "$((_hd_n - 16))" "$C_RST"
+    fi
+  } >> "$_HT/det"
+}
+
+# Join stdin lines as "a, b, c +N more" so a detail cell stays short.
+_names() {
+  awk -v max="${1:-3}" '
+    NF { n++; if (n <= max) s = s (n > 1 ? ", " : "") $0 }
+    END { if (n > max) s = s " +" (n - max) " more"; print s }
+  '
+}
+
+_hc_nodes() {
+  _f="$IDX/nodes.tsv"
+  if [ ! -s "$_f" ]; then
+    _r=$(fact "$IDX/facts.tsv" node_ready)
+    case "$_r" in
+      True) _hrow "Nodes ready" OK   "1/1 Ready" "from node describe" ;;
+      "")   _hrow "Nodes ready" N/A  "no node data in bundle" ;;
+      *)    _hrow "Nodes ready" FAIL "node Ready=$_r" ;;
+    esac
+    return 0
+  fi
+
+  set -- $(awk -F'\t' '{ n++ } $2 == "True" { r++ } $3 != "" { p++ } $4 == "cordoned" { c++ }
+                       END { print n + 0, r + 0, p + 0, c + 0 }' "$_f")
+  if [ "$2" -eq "$1" ]; then
+    _hrow "Nodes ready" OK "$2/$1 Ready" "kubelet $(fact "$IDX/facts.tsv" kubelet)"
+  else
+    _hrow "Nodes ready" FAIL "$2/$1 Ready" \
+      "$(awk -F'\t' '$2 != "True" { print $1 }' "$_f" | _names)"
+    awk -F'\t' 'BEGIN { OFS = "\t"; print "NODE", "READY" } $2 != "True" { print $1, $2 }' "$_f" \
+      | _hdet "Nodes not ready"
+  fi
+
+  if [ "$3" -eq 0 ]; then
+    _hrow "Node conditions" OK "no Memory/Disk/PID pressure" "all $1 node(s)"
+  else
+    _hrow "Node conditions" FAIL "$3 node(s) under pressure" \
+      "$(awk -F'\t' '$3 != "" { print $3 }' "$_f" | _names)"
+    awk -F'\t' 'BEGIN { OFS = "\t"; print "NODE", "CONDITIONS" } $3 != "" { print $1, $3 }' "$_f" \
+      | _hdet "Node conditions"
+  fi
+
+  if [ "$4" -eq 0 ]; then
+    _hrow "Node scheduling" OK "$1/$1 schedulable"
+  else
+    _hrow "Node scheduling" WARN "$4 node(s) cordoned" \
+      "$(awk -F'\t' '$4 == "cordoned" { print $1 }' "$_f" | _names)"
+  fi
+}
+
+_hc_node_usage() {
+  _c=$(fact "$IDX/facts.tsv" node_cpu_pct)
+  _m=$(fact "$IDX/facts.tsv" node_mem_pct)
+  if [ -z "$_c" ]; then
+    _hrow "Node CPU / memory" N/A "no k8s-top-nodes in bundle"
+    return 0
+  fi
+  # Capacity arrives as e.g. 64513400Ki; usage as 23353Mi. Show both in Gi.
+  _mem=$(printf '%s %s\n' "$(fact "$IDX/facts.tsv" node_mem_used)" "$(fact "$IDX/facts.tsv" node_memory)" \
+    | awk 'function gi(v) { if (v ~ /Ki$/) return v / 1048576; if (v ~ /Mi$/) return v / 1024
+                            if (v ~ /Gi$/) return v + 0; return v / 1073741824 }
+           { printf "%.1fGi used of %.1fGi", gi($1), gi($2) }')
+  for _u in "CPU usage:$_c:$(fact "$IDX/facts.tsv" node_cpu) cores capacity" \
+            "Memory usage:$_m:$_mem"; do
+    _lbl=${_u%%:*}; _rest=${_u#*:}; _pct=${_rest%%:*}; _det=${_rest#*:}
+    _s=OK
+    [ "$_pct" -ge 80 ] && _s=WARN
+    [ "$_pct" -ge 90 ] && _s=FAIL
+    _hrow "Node $_lbl" "$_s" "${_pct}% (warn 80, fail 90)" "$_det"
+  done
+}
+
+_hc_pods() {
+  _f="$IDX/pods.tsv"
+  set -- $(awk -F'\t' '{ n++ } $4 == "Running" { r++ } $4 == "Succeeded" || $4 == "Completed" { s++ }
+                       END { print n + 0, r + 0, s + 0 }' "$_f")
+  _bad=$(( $1 - $2 - $3 ))
+  if [ "$_bad" -eq 0 ]; then
+    _hrow "Pods active" OK "$2 Running, $3 Completed / $1" "no Pending/Failed/Unknown pods"
+  else
+    _hrow "Pods active" FAIL "$2 Running, $3 Completed, $_bad unhealthy / $1" \
+      "$(awk -F'\t' '$4 != "Running" && $4 != "Succeeded" && $4 != "Completed" { print $4 }' "$_f" \
+           | sort | uniq -c | awk '{ print $2 "=" $1 }' | _names 4)"
+    awk -F'\t' 'BEGIN { OFS = "\t"; print "NAMESPACE", "POD", "STATUS", "READY", "RESTARTS" }
+                $4 != "Running" && $4 != "Succeeded" && $4 != "Completed" { print $1, $2, $4, $3, $5 }' "$_f" \
+      | _hdet "Pods not running"
+  fi
+
+  _nr=$(awk -F'\t' '$4 == "Running" { split($3, a, "/"); if (a[1] != a[2]) n++ } END { print n + 0 }' "$_f")
+  if [ "$_nr" -eq 0 ]; then
+    _hrow "Pods ready" OK "$2/$2 Running pods ready" "all containers passing readiness"
+  else
+    _hrow "Pods ready" FAIL "$(( $2 - _nr ))/$2 Running pods ready" "$_nr pod(s) Running but not ready"
+    awk -F'\t' 'BEGIN { OFS = "\t"; print "NAMESPACE", "POD", "READY", "RESTARTS" }
+                $4 == "Running" { split($3, a, "/"); if (a[1] != a[2]) print $1, $2, $3, $5 }' "$_f" \
+      | _hdet "Running but not ready"
+  fi
+}
+
+_hc_containers() {
+  _f="$IDX/containers.tsv"
+  if [ ! -s "$_f" ]; then
+    _hrow "Containers" N/A "no pod describe data"
+    return 0
+  fi
+  # Waiting = cannot start (CrashLoopBackOff, ImagePull*, config errors).
+  # A non-zero exit on a terminated container that is not part of a finished
+  # job is a crash the pod has not yet recovered from.
+  awk -F'\t' '
+    BEGIN { OFS = "\t" }
+    NR == FNR { ph[$1 "/" $2] = $4; next }
+    {
+      n++
+      st = $5; sub(/ .*/, "", st)
+      if (st == "Waiting")                                        print "FAIL", $1, $2, $3, $5, $6
+      else if (st == "Terminated" && $7 != "" && $7 + 0 != 0 && ph[$1 "/" $2] != "Succeeded")
+                                                                   print "WARN", $1, $2, $3, $5, $6 " exit " $7
+    }
+    END { print "TOTAL", n + 0 }
+  ' "$IDX/pods.tsv" "$_f" > "$_HT/cont"
+
+  _tot=$(awk -F'\t' '$1 == "TOTAL" { print $2 }' "$_HT/cont")
+  _fail=$(grep -c '^FAIL' "$_HT/cont")
+  _warn=$(grep -c '^WARN' "$_HT/cont")
+  if [ "$_fail" -gt 0 ]; then
+    _hrow "Containers" FAIL "$_fail waiting / $_tot" \
+      "$(awk -F'\t' '$1 == "FAIL" { print $6 }' "$_HT/cont" | sort -u | _names)"
+  elif [ "$_warn" -gt 0 ]; then
+    _hrow "Containers" WARN "$_warn exited non-zero / $_tot" "pods: default ns (describe)"
+  else
+    _hrow "Containers" OK "$_tot containers, none waiting or crashed" "pods: default ns (describe)"
+  fi
+  awk -F'\t' 'BEGIN { OFS = "\t"; print "NAMESPACE", "POD", "CONTAINER", "STATE", "REASON" }
+              $1 == "FAIL" || $1 == "WARN" { print $2, $3, $4, $5, $6 }' "$_HT/cont" \
+    | _hdet "Containers waiting or crashed"
+}
+
+_hc_restarts() {
+  _reboot=$(fact "$IDX/facts.tsv" node_reboot)
+  _base=0
+  _why="no node reboot in event window"
+  if [ -n "$_reboot" ]; then
+    _base=$(_restart_baseline)
+    _why="baseline $_base = node reboot $_reboot"
+  fi
+  _n=$(awk -F'\t' -v b="$_base" '$5 + 0 > b + 0' "$IDX/pods.tsv" | wc -l | tr -d ' ')
+  if [ "$_n" -eq 0 ]; then
+    _hrow "Pod restarts" OK "no pods above baseline" "$_why"
+  else
+    _hrow "Pod restarts" WARN "$_n pod(s) above baseline" "$_why"
+    { printf 'NAMESPACE\tPOD\tRESTARTS\tAGE\n'
+      awk -F'\t' -v b="$_base" 'BEGIN { OFS = "\t" } $5 + 0 > b + 0 { print $1, $2, $5, $6 }' "$IDX/pods.tsv" \
+        | sort -t"$TAB" -k3,3nr
+    } | _hdet "Restarts above baseline"
+  fi
+}
+
+_hc_workloads() {
+  # _hc_workloads <kind> <label> <fail-status>
+  _f="$IDX/workloads.tsv"
+  set -- "$1" "$2" "$3" $(awk -F'\t' -v k="$1" '$1 == k { n++; if ($5 + 0 >= $4 + 0) ok++ }
+                                              END { print n + 0, ok + 0 }' "$_f" 2>/dev/null)
+  if [ "${4:-0}" -eq 0 ]; then
+    _hrow "$2" N/A "none in bundle"
+    return 0
+  fi
+  if [ "$5" -eq "$4" ]; then
+    _hrow "$2" OK "$5/$4 fully available" "ready >= desired replicas"
+  else
+    _hrow "$2" "$3" "$5/$4 fully available" \
+      "$(awk -F'\t' -v k="$1" '$1 == k && $5 + 0 < $4 + 0 { print $3 }' "$_f" | _names 2)"
+    awk -F'\t' -v k="$1" 'BEGIN { OFS = "\t"; print "NAMESPACE", "NAME", "DESIRED", "READY" }
+                          $1 == k && $5 + 0 < $4 + 0 { print $2, $3, $4, $5 }' "$_f" \
+      | _hdet "$2 not fully available"
+  fi
+}
+
+_hc_hpa() {
+  _f="$IDX/workloads.tsv"
+  set -- $(awk -F'\t' '$1 == "HPA" { n++; if ($6 == "ScalingActive=True") ok++ } END { print n + 0, ok + 0 }' "$_f")
+  if [ "$1" -eq 0 ]; then
+    _hrow "Autoscalers (HPA)" N/A "none in bundle"
+  elif [ "$2" -eq "$1" ]; then
+    _hrow "Autoscalers (HPA)" OK "$2/$1 scaling active" "metrics available to every HPA"
+  else
+    _hrow "Autoscalers (HPA)" WARN "$2/$1 scaling active" \
+      "$(awk -F'\t' '$1 == "HPA" && $6 != "ScalingActive=True" { print $3 }' "$_f" | _names 2)"
+    awk -F'\t' 'BEGIN { OFS = "\t"; print "NAMESPACE", "HPA", "STATE" }
+                $1 == "HPA" && $6 != "ScalingActive=True" { print $2, $3, $6 }' "$_f" \
+      | _hdet "Autoscalers not scaling"
+  fi
+}
+
+_hc_endpoints() {
+  _f="$IDX/workloads.tsv"
+  set -- $(awk -F'\t' '$1 == "Endpoints" { n++; if ($5 + 0 > 0 && $5 + 0 >= $4 + 0) ok++ }
+                       END { print n + 0, ok + 0 }' "$_f")
+  if [ "$1" -eq 0 ]; then
+    _hrow "Service endpoints" N/A "none in bundle"
+  elif [ "$2" -eq "$1" ]; then
+    _hrow "Service endpoints" OK "$2/$1 services with ready backends"
+  else
+    _hrow "Service endpoints" WARN "$2/$1 services with ready backends" \
+      "$(awk -F'\t' '$1 == "Endpoints" && ($5 + 0 == 0 || $5 + 0 < $4 + 0) { print $3 }' "$_f" | _names 2)"
+    awk -F'\t' 'BEGIN { OFS = "\t"; print "NAMESPACE", "SERVICE", "READY", "NOT-READY" }
+                $1 == "Endpoints" && ($5 + 0 == 0 || $5 + 0 < $4 + 0) { print $2, $3, $5, $4 - $5 }' "$_f" \
+      | _hdet "Services without ready endpoints"
+  fi
+}
+
+_hc_pvc() {
+  _f="$IDX/volumes.tsv"
+  if [ ! -s "$_f" ]; then
+    _hrow "PVC mounts" N/A "no PVC-backed volumes in pod specs"
+    return 0
+  fi
+  # FAIL: the claim is not in use by a healthy pod right now.
+  # WARN: healthy now, but a mount/attach/bind failure was recorded for the
+  #       pod or claim within the event window.
+  awk -F'\t' '
+    BEGIN { OFS = "\t" }
+    NR == FNR {
+      if ($3 ~ /^(FailedMount|FailedAttachVolume|FailedMapVolume|FailedBinding|ProvisioningFailed|VolumeResizeFailed)$/)
+        ev[$5 "/" $6] = $3
+      next
+    }
+    {
+      sev = "OK"; why = "mounted"
+      if ($5 != "yes")                                { sev = "FAIL"; why = "not referenced by any volumeMount" }
+      else if ($6 != "Running" && $6 != "Succeeded")  { sev = "FAIL"; why = "pod " $6 }
+      else if ($6 == "Running") {
+        split($7, a, "/")
+        if (a[1] != a[2])                             { sev = "FAIL"; why = "pod not ready (" $7 ")" }
+      }
+      if (sev == "OK" && ($1 "/" $2) in ev)           { sev = "WARN"; why = ev[$1 "/" $2] " event" }
+      if (sev == "OK" && ($1 "/" $4) in ev)           { sev = "WARN"; why = ev[$1 "/" $4] " event" }
+      print sev, $1, $4, $2, $6, why
+    }
+  ' "$IDX/events.tsv" "$_f" > "$_HT/pvc"
+
+  set -- $(awk -F'\t' '{ n++ } $1 == "FAIL" { f++ } $1 == "WARN" { w++ } END { print n + 0, f + 0, w + 0 }' "$_HT/pvc")
+  if [ "$2" -gt 0 ]; then
+    _hrow "PVC mounts" FAIL "$(( $1 - $2 ))/$1 claims mounted" \
+      "$(awk -F'\t' '$1 == "FAIL" { print $3 }' "$_HT/pvc" | _names 2)"
+  elif [ "$3" -gt 0 ]; then
+    _hrow "PVC mounts" WARN "$1/$1 claims mounted" "$3 had mount-failure events"
+  else
+    _hrow "PVC mounts" OK "$1/$1 claims mounted" "pods Running+Ready, no mount events"
+  fi
+  awk -F'\t' 'BEGIN { OFS = "\t"; print "STATUS", "CLAIM", "POD", "PHASE", "NOTE" }
+              { print $1, $3, $4, $5, $6 }' "$_HT/pvc" > "$_HT/pvc.all"
+  if [ "$2" -gt 0 ] || [ "$3" -gt 0 ]; then
+    _hdet "PVC mounts" < "$_HT/pvc.all"
+  fi
+}
+
+_hc_certs() {
+  _r=$(fact "$IDX/facts.tsv" cert_k3s_reason)
+  _t=$(fact "$IDX/facts.tsv" cert_k3s_ts)
+  _m=$(fact "$IDX/facts.tsv" cert_k3s_msg)
+  case "$_r" in
+    "")                          _hrow "Certificates (k3s)" N/A  "no k3s certificate check event" "k3s reports this at startup" ;;
+    CertificateExpirationOK)     _hrow "Certificates (k3s)" OK   "node + CA certs valid, not expiring" "checked $_t" ;;
+    CertificateExpirationWarning) _hrow "Certificates (k3s)" WARN "certificates expiring soon" "$(printf '%s' "$_m" | cut -c1-60)" ;;
+    *)                           _hrow "Certificates (k3s)" FAIL "$_r" "$(printf '%s' "$_m" | cut -c1-60)" ;;
+  esac
+
+  _v=$(fact "$IDX/facts.tsv" cert_merger_valid)
+  _s=$(fact "$IDX/facts.tsv" cert_merger_skipped)
+  _e=$(fact "$IDX/facts.tsv" cert_merger_errors)
+  if [ -z "$_v" ] && [ -z "$_e" ]; then
+    _hrow "CA trust bundle" N/A "no cert-merger-controller log"
+  elif [ "${_e:-0}" -gt 0 ] || [ "${_s:-0}" -gt 0 ]; then
+    _hrow "CA trust bundle" WARN "${_v:-?} valid, ${_s:-0} skipped, ${_e:-0} errors" "see cert-merger-controller log"
+  else
+    _hrow "CA trust bundle" OK "${_v:-?} valid CA certs, 0 skipped" "cert-merger-controller"
+  fi
+
+  _f="$IDX/tls.tsv"
+  if [ ! -s "$_f" ]; then
+    _hrow "TLS errors in logs" OK "no x509/handshake failures" "all current container logs"
+  else
+    set -- $(awk -F'\t' '{ n++; t += $4 } END { print n + 0, t + 0 }' "$_f")
+    _hrow "TLS errors in logs" FAIL "$2 line(s) in $1 container(s)" \
+      "$(awk -F'\t' '{ print $3 }' "$_f" | _names 2)"
+    { printf 'NAMESPACE\tPOD\tCONTAINER\tLINES\n'; cat "$_f"; } | _hdet "TLS / certificate errors in logs"
+  fi
+}
+
+_hc_redis() {
+  _b=$(fact "$IDX/facts.tsv" redis_bgsave_status)
+  _a=$(fact "$IDX/facts.tsv" redis_aof_status)
+  _ae=$(fact "$IDX/facts.tsv" redis_aof_enabled)
+  if [ -z "$_b" ]; then
+    _hrow "Redis persistence" N/A "no redis persistence info"
+  elif [ "$_b" = "ok" ] && { [ "$_ae" != "1" ] || [ "$_a" = "ok" ]; }; then
+    _hrow "Redis persistence" OK "rdb $_b, aof ${_a:-off}" "last snapshot and AOF writes succeeded"
+  else
+    _hrow "Redis persistence" FAIL "rdb $_b, aof ${_a:-off}" "persistence to disk is failing"
+  fi
+}
+
+_hc_events() {
+  set -- $(awk -F'\t' '$2 == "Warning" { n++; c += $7 } END { print n + 0, c + 0 }' "$IDX/events.tsv")
+  if [ "$1" -eq 0 ]; then
+    _hrow "Warning events" OK "none" "$(fact "$IDX/facts.tsv" events_from) .."
+  else
+    _hrow "Warning events" WARN "$1 events ($2 occurrences)" \
+      "top: $(awk -F'\t' '$2 == "Warning" { n[$3] += $7 } END { for (r in n) print n[r] "\t" r }' "$IDX/events.tsv" \
+                | sort -t"$TAB" -k1,1nr | head -2 | awk -F'\t' '{ print $2 "=" $1 }' | _names 2)"
+  fi
+}
+
+_hc_logs() {
+  set -- $(awk -F'\t' '$4 == "current" { n++; if ($7 + 0 > 0) e++; t += $7 } END { print n + 0, e + 0, t + 0 }' "$IDX/logs.tsv")
+  if [ "$2" -eq 0 ]; then
+    _hrow "Container log errors" OK "0 error lines" "$1 current logs scanned"
+  else
+    _hrow "Container log errors" WARN "$2/$1 logs with errors ($3 lines)" \
+      "$(awk -F'\t' '$4 == "current" && $7 + 0 > 0 { print $7 "\t" $3 }' "$IDX/logs.tsv" \
+           | sort -t"$TAB" -k1,1nr | cut -f2 | _names 2)"
+  fi
+}
+
+_hc_coverage() {
+  _p=$(flines "$IDX/pods.tsv")
+  _c=$(awk -F'\t' '{ print $1 "/" $2 }' "$IDX/containers.tsv" | sort -u | wc -l | tr -d ' ')
+  _hrow "Bundle coverage" INFO "$_c/$_p pods with describe data" "$(flines "$IDX/logs.tsv") log files"
+}
+
+sum_health() {
+  _HT="${TMPDIR:-/tmp}/k8shelp.health.$$"
+  mkdir -p "$_HT" || return 0
+  : > "$_HT/rows"; : > "$_HT/det"
+
+  _hc_nodes
+  _hc_node_usage
+  _hc_pods
+  _hc_containers
+  _hc_restarts
+  _hc_workloads Deployment  "Deployments"  FAIL
+  _hc_workloads StatefulSet "StatefulSets" FAIL
+  _hc_workloads DaemonSet   "DaemonSets"   FAIL
+  _hc_hpa
+  _hc_endpoints
+  _hc_pvc
+  _hc_certs
+  _hc_redis
+  _hc_events
+  _hc_logs
+  _hc_coverage
+
+  hdr "HEALTH CHECKS"
+  # Colour is applied after alignment: tsv_table pads on byte length, so
+  # escape codes inside a cell would push every following column out.
+  { printf 'CHECK\tSTATUS\tRESULT\tDETAIL\n'; cat "$_HT/rows"; } \
+    | tsv_box \
+    | awk -v g="$C_GRN" -v y="$C_YEL" -v r="$C_RED" -v d="$C_DIM" -v b="$C_B" -v x="$C_RST" '
+        # Border lines pass through; the header row is the first line that
+        # names STATUS, and its byte offset locates the status cell below.
+        !p && /STATUS/ { p = index($0, "STATUS"); print "  " b $0 x; next }
+        !p || !/^\|/ { print "  " $0; next }
+        {
+          s = substr($0, p, 4); c = ""
+          if      (s == "FAIL") c = r
+          else if (s == "WARN") c = y
+          else if (s == "OK  " || s == "OK")  c = g
+          else                  c = d
+          print "  " substr($0, 1, p - 1) c b substr($0, p, 4) x substr($0, p + 4)
+        }'
+
+  set -- $(awk -F'\t' '$2 == "FAIL" { f++ } $2 == "WARN" { w++ } END { print f + 0, w + 0 }' "$_HT/rows")
+  if [ "$1" -gt 0 ]; then
+    printf '\n  %sOVERALL: UNHEALTHY%s  (%s failed, %s warnings)\n' "$C_B$C_RED" "$C_RST" "$1" "$2"
+  elif [ "$2" -gt 0 ]; then
+    printf '\n  %sOVERALL: DEGRADED%s  (%s warnings, no failures)\n' "$C_B$C_YEL" "$C_RST" "$2"
+  else
+    printf '\n  %sOVERALL: HEALTHY%s  (all checks passed)\n' "$C_B$C_GRN" "$C_RST"
+  fi
+
+  if [ -s "$_HT/det" ]; then
+    printf '\n%sATTENTION%s' "$C_B$C_CYN" "$C_RST"
+    cat "$_HT/det"
+  fi
+
+  rm -rf "$_HT"
+}
+
+cmd_summary() {
+  sum_health
+  sum_cluster
+  sum_pods
+  sum_restarts
+  sum_events
+  sum_usage
+  sum_logs
+  sum_coverage
+  printf '\n'
+}
+
+# ------------------------------------------------------------------- dispatch
+
+case "${CMD:-}" in
+  summary) cmd_summary ;;
+  menu)    cmd_menu ;;
+  "")      # Interactive by default; piped or redirected output gets the
+           # summary, so `k8s-help --file=x > report.txt` still works.
+           if [ -t 0 ] && [ -t 1 ]; then cmd_menu; else cmd_summary; fi ;;
+  *)       usage ;;
+esac
